@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<!-- Set the document encoding to UTF-8 for universal character support -->
+
+<title>ThingsBoard Accelerometer Monitor with Per-Axis Calibration</title>
+<!-- Page title displayed in the browser tab -->
+
+<!-- Google Charts loader for plotting combined accelerometer, velocity, RMS, and predicted handheld RMS -->
+<script src="https://www.gstatic.com/charts/loader.js"></script>
+
+<style>
+/* ================= BASIC PAGE STYLING ================= */
+body { 
+  font-family: Arial; /* Use a clean, readable font */
+  padding: 20px;      /* Space around page content */
+  margin:0;           /* Remove default margin */
+}
+
+h3 { 
+  margin-bottom: 10px; /* Space after headings */
+}
+
+input { 
+  padding: 6px;        /* Add padding inside input boxes */
+  margin-top: 6px;     /* Space above inputs */
+  width: 160px;         /* Fixed width for uniformity */
+  text-align:center;   /* Center-align numbers in inputs */
+}
+
+button { 
+  padding: 6px 10px;   /* Comfortable clickable area */
+  margin-top: 6px;     /* Space above buttons */
+  cursor: pointer;     /* Show pointer on hover for clarity */
+}
+
+.hidden { display: none; } /* Utility class to hide elements (e.g., until login succeeds) */
+
+#debugOutput { 
+  font-family: monospace;    /* Monospaced font for JSON/debug output */
+  margin-top: 10px;          /* Space above output */
+  color:#333;                /* Dark gray text for readability */
+  white-space: pre-wrap;     /* Preserve spacing and line breaks */
+}
+
+table { 
+  border-collapse: collapse; /* Merge table borders */
+  width: 100%;               /* Full width table */
+  margin-top: 25px;          /* Space above table */
+}
+
+table, th, td { 
+  border: 1px solid #999;    /* Gray border for table and cells */
+}
+
+th, td { 
+  padding: 6px;              /* Space inside cells */
+  text-align: center;        /* Center-align text in cells */
+  font-size: 12px;           /* Smaller font for large tables */
+}
+
+th { background-color: #eee; } /* Light gray background for headers */
+
+.calibration-table td input { 
+  width: 70px;               /* Slightly wider input boxes for calibration */
+}
+</style>
+</head>
+<body>
+
+<!-- ================= LOGIN SECTION ================= -->
+<h3>Calibration Setup for Firmware Calculations</h3>
+<div id="loginDiv">
+  Username: <input type="text" id="tbUser"><br> <!-- Text input for username -->
+  Password: <input type="password" id="tbPass"><br> <!-- Password input (hidden text) -->
+  <button id="loginBtn">Login</button> <!-- Button to trigger authentication -->
+  <p id="loginStatus"></p> <!-- Placeholder for login success/error messages -->
+</div>
+
+<!-- ================= MONITOR SECTION (HIDDEN UNTIL LOGIN) ================= -->
+<div id="monitorDiv" class="hidden">
+
+  <!-- RPM input -->
+  <h3>RPM Settings</h3>
+  RPM: <input type="number" id="rpmInput" value="980"><br> 
+  <!-- User enters machine RPM to estimate dominant vibration frequency -->
+
+  <!-- Calibration table for 5-point per-axis scaling -->
+  <h3>Calibration — 5 Tests</h3>
+  <p>Enter Taglite Movement RMS values (X, Y, Z in mm/s) and Handheld RMS (mm/s) for each test.</p>
+  <table class="calibration-table">
+    <thead>
+      <tr>
+        <th>Test</th>
+        <th>Movement X RMS</th>
+        <th>Movement Y RMS</th>
+        <th>Movement Z RMS</th>
+        <th>Handheld RMS</th>
+      </tr>
+    </thead>
+    <tbody>
+      <!-- Five rows for calibration data input -->
+      <tr><td>1</td><td><input id="calX1"></td><td><input id="calY1"></td><td><input id="calZ1"></td><td><input id="calH1"></td></tr>
+      <tr><td>2</td><td><input id="calX2"></td><td><input id="calY2"></td><td><input id="calZ2"></td><td><input id="calH2"></td></tr>
+      <tr><td>3</td><td><input id="calX3"></td><td><input id="calY3"></td><td><input id="calZ3"></td><td><input id="calH3"></td></tr>
+      <tr><td>4</td><td><input id="calX4"></td><td><input id="calY4"></td><td><input id="calZ4"></td><td><input id="calH4"></td></tr>
+      <tr><td>5</td><td><input id="calX5"></td><td><input id="calY5"></td><td><input id="calZ5"></td><td><input id="calH5"></td></tr>
+    </tbody>
+  </table>
+  <button id="computeCalBtn">Compute Calibration Factor</button> <!-- Trigger calculation of per-axis k factors -->
+  <p>Axis Scaling Factors: <span id="avgFactor">N/A</span></p> <!-- Display resulting k_X, k_Y, k_Z -->
+
+  <!-- Debug output for raw JSON -->
+  <h3></h3>
+  <div id="debugOutput"></div>
+
+  <!-- Combined chart -->
+  <h3></h3>
+  <div id="combinedChart" style="width:100%; height:500px;"></div>
+
+  <!-- Live data table -->
+  <h3>Data Table (Live Values)</h3>
+  <table id="dataTable">
+    <thead>
+      <tr>
+        <th>Time</th>
+        <th>Raw X (mg)</th>
+        <th>Raw Y (mg)</th>
+        <th>Raw Z (mg)</th>
+        <th>Acc X (mm/s)</th>
+        <th>Acc Y (mm/s)</th>
+        <th>Acc Z (mm/s)</th>
+        <th>Velocity X (mm/s)</th>
+        <th>Velocity Y (mm/s)</th>
+        <th>Velocity Z (mm/s)</th>
+        <th>RMS X (mm/s)</th>
+        <th>RMS Y (mm/s)</th>
+        <th>RMS Z (mm/s)</th>
+        <th>Vector RMS (mm/s)</th>
+        <th>Predicted Handheld X (mm/s)</th>
+        <th>Predicted Handheld Y (mm/s)</th>
+        <th>Predicted Handheld Z (mm/s)</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+</div>
+
+<script>
+// ================= GLOBAL VARIABLES =================
+let jwtToken = null; // Will hold authentication token after login
+let lastDataTs = null; // Timestamp of last fetched telemetry
+let firstFetchDone = false; // Flag to differentiate first fetch (full 10-min load)
+let allSeenTimestamps = new Set(); // Prevent duplicate processing of same timestamp
+
+// Arrays to hold historical data for plotting and calculations
+let rawHistory = [];          // Raw accelerometer data in mg
+let accHistory = [];          // Converted acceleration in mm/s
+let velocityHistory = [];     // Calculated velocity in mm/s
+let filteredRMSHistory = [];  // RMS values per axis over window
+let handheldPredHistory = []; // Predicted handheld RMS values per axis
+
+// Google Charts variables
+let combinedChart, combinedData;
+
+// RMS calculation window in seconds
+let rmsWindowSec = 10;
+
+// Chart refresh interval in seconds
+let bucketSeconds = 5;
+let lastChartUpdate = 0;
+
+// ================= PER-AXIS CALIBRATION =================
+window.kX = 1.0; // Initial X-axis scaling factor (k_X)
+window.kY = 1.0; // Initial Y-axis scaling factor (k_Y)
+window.kZ = 1.0; // Initial Z-axis scaling factor (k_Z)
+
+// ================= INITIALIZE GOOGLE CHART =================
+google.charts.load('current', {packages:['corechart']});
+google.charts.setOnLoadCallback(initCharts);
+
+// Function to initialize the line chart and columns
+function initCharts(){
+  combinedData = new google.visualization.DataTable();
+  combinedData.addColumn('datetime','Time'); // X-axis time
+  combinedData.addColumn('number','Raw X');
+  combinedData.addColumn('number','Raw Y');
+  combinedData.addColumn('number','Raw Z');
+  combinedData.addColumn('number','Acc X');
+  combinedData.addColumn('number','Acc Y');
+  combinedData.addColumn('number','Acc Z');
+  //combinedData.addColumn('number','Velocity X');
+  //combinedData.addColumn('number','Velocity Y');
+  //combinedData.addColumn('number','Velocity Z');
+  combinedData.addColumn('number','RMS X');
+  combinedData.addColumn('number','RMS Y');
+  combinedData.addColumn('number','RMS Z');
+  combinedData.addColumn('number','Vector RMS'); // Combined RMS magnitude
+  combinedData.addColumn('number','Predicted Handheld X');
+  combinedData.addColumn('number','Predicted Handheld Y');
+  combinedData.addColumn('number','Predicted Handheld Z');
+
+  combinedChart = new google.visualization.LineChart(document.getElementById('combinedChart'));
+}
+
+// ================= UPDATE CHART =================
+function updateCombinedChart(){
+  const now = Date.now();
+  // Throttle chart updates to avoid excessive redraws
+  if(now - lastChartUpdate < bucketSeconds*1000) return;
+  lastChartUpdate = now;
+
+  const maxPoints = 20*60; // Limit number of points for performance (~20 min at 1 Hz)
+
+  const combinedHistory = [];
+  // Loop through historical data arrays and prepare chart rows
+  for(let i=0;i<rawHistory.length;i++){
+    combinedHistory.push([
+      rawHistory[i][0],
+      rawHistory[i][1], rawHistory[i][2], rawHistory[i][3], // Raw mg
+      accHistory[i][1], accHistory[i][2], accHistory[i][3], // Acceleration mm/s
+      //velocityHistory[i][1], velocityHistory[i][2], velocityHistory[i][3], // Velocity mm/s
+      filteredRMSHistory[i][1], filteredRMSHistory[i][2], filteredRMSHistory[i][3], // RMS
+      Math.sqrt(filteredRMSHistory[i][1]**2 + filteredRMSHistory[i][2]**2 + filteredRMSHistory[i][3]**2), // Vector RMS
+      handheldPredHistory[i][1], handheldPredHistory[i][2], handheldPredHistory[i][3] // Predicted handheld RMS
+    ]);
+  }
+
+  // Trim old points to keep maxPoints
+  if(combinedHistory.length>maxPoints) combinedHistory.splice(0, combinedHistory.length-maxPoints);
+
+  combinedData.removeRows(0, combinedData.getNumberOfRows());
+  combinedData.addRows(combinedHistory);
+
+  // Draw chart with logarithmic Y-axis to cover wide dynamic range
+  combinedChart.draw(combinedData,{
+    title:'Combined Accelerometer/Velocity/RMS Chart',
+    legend:{position:'bottom'},
+    chartArea:{width:'85%',height:'70%'},
+    colors:['blue','red','green','orange','purple','brown','cyan','magenta','lime','darkorange','pink','teal','navy'],
+    vAxis:{logScale:true} // Logarithmic scale to emphasize low-amplitude signals
+  });
+}
+
+// ================= RMS FUNCTION =================
+// Compute RMS over a sliding window (windowSec)
+function computeRMS(axisValues, timestamps, windowSec){
+  const now = timestamps[timestamps.length-1]; // Current time
+  const cutoff = new Date(now.getTime() - windowSec*1000); // Start of window
+  let sumSq = 0, count = 0;
+  for(let i=timestamps.length-1;i>=0;i--){
+    if(timestamps[i]<cutoff) break; // Only include samples in the window
+    sumSq += axisValues[i]*axisValues[i]; // Square each value
+    count++;
+  }
+  return count>0 ? Math.sqrt(sumSq/count) : 0; // RMS = sqrt(mean(square))
+}
+
+// ================= 5-POINT PER-AXIS CALIBRATION =================
+document.getElementById("computeCalBtn").addEventListener("click",()=>{
+  let kXsum=0, kYsum=0, kZsum=0, count=0;
+  for(let i=1;i<=5;i++){
+    const x = parseFloat(document.getElementById("calX"+i).value)||0;
+    const y = parseFloat(document.getElementById("calY"+i).value)||0;
+    const z = parseFloat(document.getElementById("calZ"+i).value)||0;
+    const h = parseFloat(document.getElementById("calH"+i).value)||0;
+
+    if(x>0) kXsum += h/x; // Per-test X-axis scaling factor
+    if(y>0) kYsum += h/y; // Y-axis
+    if(z>0) kZsum += h/z; // Z-axis
+    count++; // Count valid tests
+  }
+  window.kX = kXsum / count; // Average scaling factor X
+  window.kY = kYsum / count; // Y
+  window.kZ = kZsum / count; // Z
+
+  document.getElementById("avgFactor").textContent = 
+    `X: ${window.kX.toFixed(3)}, Y: ${window.kY.toFixed(3)}, Z: ${window.kZ.toFixed(3)}`;
+});
+
+// ================= UPDATE TABLE =================
+function updateTable(ts,rowHtml,rawX,rawY,rawZ,accX,accY,accZ,velX,velY,velZ){
+  const tbody=document.getElementById('dataTable').querySelector('tbody');
+  const tr=document.createElement('tr');
+  tr.innerHTML=rowHtml; // Fill row with initial placeholders
+  tbody.appendChild(tr);
+
+  // Keep last 200 rows only for performance
+  while(tbody.rows.length>200) tbody.deleteRow(0);
+
+  // Prepare arrays for RMS calculation
+  const rows = Array.from(tbody.rows);
+  const timestamps = rows.map(r=>new Date(r.cells[0].textContent));
+  const accXvals = rows.map(r=>parseFloat(r.cells[4].textContent));
+  const accYvals = rows.map(r=>parseFloat(r.cells[5].textContent));
+  const accZvals = rows.map(r=>parseFloat(r.cells[6].textContent));
+
+  const rmsX = computeRMS(accXvals, timestamps, rmsWindowSec);
+  const rmsY = computeRMS(accYvals, timestamps, rmsWindowSec);
+  const rmsZ = computeRMS(accZvals, timestamps, rmsWindowSec);
+
+  const vectorRMS = Math.sqrt(rmsX*rmsX + rmsY*rmsY + rmsZ*rmsZ);
+
+  // Apply per-axis scaling factors for handheld prediction
+  const predictedHandheldX = rmsX * (window.kX || 1.0);
+  const predictedHandheldY = rmsY * (window.kY || 1.0);
+  const predictedHandheldZ = rmsZ * (window.kZ || 1.0);
+
+  // Update table cells with computed RMS and predicted values
+  tr.cells[10].textContent = rmsX.toFixed(2);
+  tr.cells[11].textContent = rmsY.toFixed(2);
+  tr.cells[12].textContent = rmsZ.toFixed(2);
+  tr.cells[13].textContent = vectorRMS.toFixed(2);
+  tr.cells[14].textContent = predictedHandheldX.toFixed(2);
+  tr.cells[15].textContent = predictedHandheldY.toFixed(2);
+  tr.cells[16].textContent = predictedHandheldZ.toFixed(2);
+
+  // Push data into historical arrays for charting
+  rawHistory.push([new Date(ts), rawX, rawY, rawZ]);
+  accHistory.push([new Date(ts), accX, accY, accZ]);
+  velocityHistory.push([new Date(ts), velX, velY, velZ]);
+  filteredRMSHistory.push([new Date(ts), rmsX, rmsY, rmsZ]);
+  handheldPredHistory.push([new Date(ts), predictedHandheldX, predictedHandheldY, predictedHandheldZ]);
+
+  updateCombinedChart();
+}
+
+// ================= LOGIN & FETCH =================
+document.getElementById("loginBtn").addEventListener("click",async ()=>{
+  const user=document.getElementById("tbUser").value;
+  const pass=document.getElementById("tbPass").value;
+
+  // Send login request to ThingsBoard
+  const res = await fetch("https://thingsboard.intarget.mobi/api/auth/login",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({username:user,password:pass})
+  });
+
+  const data=await res.json();
+  jwtToken=data.token; // Store JWT token for future requests
+
+  // Show monitor, hide login
+  document.getElementById("loginDiv").classList.add("hidden");
+  document.getElementById("monitorDiv").classList.remove("hidden");
+
+  fetchAccelerometerData(); // Initial fetch
+  setInterval(fetchAccelerometerData,10000); // Repeat every 10 seconds
+});
+
+// ================= FETCH DATA =================
+async function fetchAccelerometerData(){
+  if(!jwtToken) return; // Stop if not logged in
+
+  const deviceId="2a3154a0-0ca1-11f1-ba20-7f81682430c4"; // Target device ID
+  const key="accelerometer"; // Telemetry key
+  const now=Date.now();
+  let startTs = !firstFetchDone ? now-(10*60*1000) : lastDataTs+1; // Initial fetch 10 min back
+
+  const url=`https://thingsboard.intarget.mobi/api/plugins/telemetry/DEVICE/${deviceId}/values/timeseries?keys=${key}&startTs=${startTs}&endTs=${now}&limit=1000`;
+  const res=await fetch(url,{headers:{"X-Authorization":"Bearer "+jwtToken}});
+  const json=await res.json();
+  const dataArr=(json[key]||[]).sort((a,b)=>a.ts-b.ts); // Sort by timestamp
+
+  if(dataArr.length===0) return;
+
+  lastDataTs=dataArr[dataArr.length-1].ts;
+  firstFetchDone=true;
+
+  const rpm=Number(document.getElementById("rpmInput").value)||600; // Read RPM
+  const twoPiF=2*Math.PI*(rpm/60); // Angular frequency ω = 2πf
+
+  dataArr.forEach(point=>{
+    const ts=point.ts;
+    if(allSeenTimestamps.has(ts)) return; // Skip duplicates
+    allSeenTimestamps.add(ts);
+
+    let mgX=0, mgY=0, mgZ=0;
+    try{
+      const obj=(typeof point.value==='string')?JSON.parse(point.value):point.value;
+      mgX=Number(obj.x_dev)||0;
+      mgY=Number(obj.y_dev)||0;
+      mgZ=Number(obj.z_dev)||0;
+    }catch{}
+
+    // Convert raw mg acceleration to velocity in mm/s
+    // a (m/s²) = mg * 0.00981
+    // v (mm/s) = a / (2πf) * 1000
+    const accX = mgX*0.00981*1000/twoPiF;
+    const accY = mgY*0.00981*1000/twoPiF;
+    const accZ = mgZ*0.00981*1000/twoPiF;
+
+    // For now, velocity stored same as acc (placeholder)
+    const velX = accX;
+    const velY = accY;
+    const velZ = accZ;
+
+    // Add data row to table and update chart
+    updateTable(
+      ts,
+      `<td>${new Date(ts).toLocaleTimeString()}</td>
+       <td>${mgX.toFixed(2)}</td>
+       <td>${mgY.toFixed(2)}</td>
+       <td>${mgZ.toFixed(2)}</td>
+       <td>${accX.toFixed(2)}</td>
+       <td>${accY.toFixed(2)}</td>
+       <td>${accZ.toFixed(2)}</td>
+       <td>${velX.toFixed(2)}</td>
+       <td>${velY.toFixed(2)}</td>
+       <td>${velZ.toFixed(2)}</td>
+       <td>0</td><td>0</td><td>0</td>
+       <td>0</td><td>0</td><td>0</td><td>0</td>`,
+      mgX, mgY, mgZ,
+      accX, accY, accZ,
+      velX, velY, velZ
+    );
+  });
+}
+</script>
+
+</body>
+</html>
+
+
